@@ -10,6 +10,7 @@ namespace Microsoft.Azure.Cosmos
     using System.Threading;
     using System.Threading.Tasks;
     using Microsoft.Azure.Cosmos.Handlers;
+    using Microsoft.Azure.Cosmos.Query.Core.Pipeline.CrossPartition.HybridSearch;
     using Microsoft.Azure.Cosmos.Tracing;
     using Microsoft.Azure.Documents;
     using Telemetry;
@@ -34,6 +35,8 @@ namespace Microsoft.Azure.Cosmos
         internal abstract RequestInvokerHandler RequestHandler { get; }
 
         internal abstract CosmosClientOptions ClientOptions { get; }
+
+        internal abstract FullTextScoreStatsCache FullTextScoreStatsCache { get; }
 
         internal abstract string UserAgent { get; }
 

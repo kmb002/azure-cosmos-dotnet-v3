@@ -9,6 +9,7 @@ namespace Microsoft.Azure.Cosmos.EmulatorTests.Query
     using System.Text;
     using System.Threading.Tasks;
     using Microsoft.Azure.Cosmos.CosmosElements;
+    using Microsoft.Azure.Cosmos.Diagnostics;
     using Microsoft.VisualStudio.TestTools.UnitTesting;
 
     [TestClass]
@@ -16,6 +17,14 @@ namespace Microsoft.Azure.Cosmos.EmulatorTests.Query
     public sealed class HybridSearchQueryTests : QueryTestsBase
     {
         private const string CollectionDataPath = "Documents\\text-3properties-1536dimensions-100documents.json";
+        private const string CacheDiagnosticsQuery = @"
+            SELECT TOP 10 c.index AS Index, c.title AS Title, c.text AS Text
+            FROM c
+            WHERE FullTextContains(c.title, 'John') OR FullTextContains(c.text, 'John') OR FullTextContains(c.text, 'United States')
+            ORDER BY RANK RRF(FullTextScore(c.title, 'John'), FullTextScore(c.text, 'United States'))";
+        private const string FullTextScoreStatsCacheStatusDatum = "BM25FullTextScoreStatsCacheStatus";
+        private const string FullTextScoreStatsCacheHit = "Hit";
+        private const string FullTextScoreStatsCacheMiss = "Miss";
 
         private const string SampleVector = @"[0.02, 0, -0.02, 0, -0.04, -0.01, -0.04, -0.01, 0.06, 0.08, -0.05, -0.04, -0.03, 0.05, -0.03, 0, -0.03, 0, 0.05, 0, 0.03,
 0.02, 0, 0.04, 0.05, 0.03, 0, 0, 0, -0.03, -0.01, 0.01, 0, -0.01, -0.03, -0.02, -0.05, 0.01, 0, 0.01, 0, 0.01, -0.03, -0.02, 0.02, 0.02, 0.04, 0.01, 0.04, 0.02, -0.01, -0.01, 0.02, 0.01, 0.02, -0.04, -0.01, 0.06, -0.01, -0.03, -0.04, -0.01, -0.01, 0, 0.03,
@@ -189,6 +198,90 @@ namespace Microsoft.Azure.Cosmos.EmulatorTests.Query
             await this.RunTests(testCases);
         }
 
+        [TestMethod]
+        public async Task FullTextScoreStatsCacheAddsHitAndMissDiagnostics()
+        {
+            CosmosArray documentsArray = await LoadDocuments();
+            IEnumerable<string> documents = documentsArray.Select(document => document.ToString());
+            string databaseId = this.database.Id;
+
+            await this.CreateIngestQueryDeleteAsync(
+                connectionModes: ConnectionModes.Direct,
+                collectionTypes: CollectionTypes.MultiPartition,
+                documents: documents,
+                query: async (container, _) =>
+                {
+                    using CosmosClient cacheEnabledClient = SDK.EmulatorTests.TestCommon.CreateCosmosClient(
+                        useGateway: false,
+                        customizeClientBuilder: builder => builder.WithFullTextScoreStatsCacheTtl(TimeSpan.FromMinutes(5)));
+                    Container cacheEnabledContainer = cacheEnabledClient.GetContainer(databaseId, container.Id);
+
+                    QueryRequestOptions requestOptions = new QueryRequestOptions
+                    {
+                        FullTextScoreScope = FullTextScoreScope.Global,
+                        MaxItemCount = 10,
+                    };
+
+                    (List<int> missIndices, List<string> missStatuses) = await ExecuteQueryAndCollectCacheStatusesAsync(
+                        cacheEnabledContainer,
+                        CacheDiagnosticsQuery,
+                        requestOptions);
+                    (List<int> hitIndices, List<string> hitStatuses) = await ExecuteQueryAndCollectCacheStatusesAsync(
+                        cacheEnabledContainer,
+                        CacheDiagnosticsQuery,
+                        requestOptions);
+
+                    CollectionAssert.AreEqual(missIndices, hitIndices);
+                    Assert.IsTrue(missStatuses.Contains(FullTextScoreStatsCacheMiss), "Expected a cache miss diagnostic on the first global query.");
+                    Assert.IsFalse(missStatuses.Contains(FullTextScoreStatsCacheHit), "Did not expect a cache hit diagnostic on the first global query.");
+                    Assert.IsTrue(hitStatuses.Contains(FullTextScoreStatsCacheHit), "Expected a cache hit diagnostic on the second global query.");
+                    Assert.IsFalse(hitStatuses.Contains(FullTextScoreStatsCacheMiss), "Did not expect a cache miss diagnostic on the second global query.");
+                },
+                partitionKey: "/index",
+                indexingPolicy: CompositeIndexPolicy);
+        }
+
+        [TestMethod]
+        public async Task FullTextScoreStatsCacheLocalScopeBypassesDiagnostics()
+        {
+            CosmosArray documentsArray = await LoadDocuments();
+            IEnumerable<string> documents = documentsArray.Select(document => document.ToString());
+            string databaseId = this.database.Id;
+
+            await this.CreateIngestQueryDeleteAsync(
+                connectionModes: ConnectionModes.Direct,
+                collectionTypes: CollectionTypes.MultiPartition,
+                documents: documents,
+                query: async (container, _) =>
+                {
+                    using CosmosClient cacheEnabledClient = SDK.EmulatorTests.TestCommon.CreateCosmosClient(
+                        useGateway: false,
+                        customizeClientBuilder: builder => builder.WithFullTextScoreStatsCacheTtl(TimeSpan.FromMinutes(5)));
+                    Container cacheEnabledContainer = cacheEnabledClient.GetContainer(databaseId, container.Id);
+
+                    QueryRequestOptions requestOptions = new QueryRequestOptions
+                    {
+                        FullTextScoreScope = FullTextScoreScope.Local,
+                        MaxItemCount = 10,
+                    };
+
+                    (List<int> firstIndices, List<string> firstStatuses) = await ExecuteQueryAndCollectCacheStatusesAsync(
+                        cacheEnabledContainer,
+                        CacheDiagnosticsQuery,
+                        requestOptions);
+                    (List<int> secondIndices, List<string> secondStatuses) = await ExecuteQueryAndCollectCacheStatusesAsync(
+                        cacheEnabledContainer,
+                        CacheDiagnosticsQuery,
+                        requestOptions);
+
+                    CollectionAssert.AreEqual(firstIndices, secondIndices);
+                    Assert.AreEqual(0, firstStatuses.Count, "Did not expect cache diagnostics for local full text score scope.");
+                    Assert.AreEqual(0, secondStatuses.Count, "Did not expect cache diagnostics for local full text score scope.");
+                },
+                partitionKey: "/index",
+                indexingPolicy: CompositeIndexPolicy);
+        }
+
         private async Task RunTests(IEnumerable<SanityTestCase> testCases)
         {
             CosmosArray documentsArray = await LoadDocuments();
@@ -250,6 +343,29 @@ namespace Microsoft.Azure.Cosmos.EmulatorTests.Query
                     }
                 }
             }
+        }
+
+        private static async Task<(List<int> indices, List<string> cacheStatuses)> ExecuteQueryAndCollectCacheStatusesAsync(
+            Container container,
+            string query,
+            QueryRequestOptions requestOptions)
+        {
+            List<int> indices = new List<int>();
+            List<string> cacheStatuses = new List<string>();
+
+            await foreach (FeedResponse<TextDocument> response in RunSimpleQueryAsync<TextDocument>(container, query, requestOptions))
+            {
+                indices.AddRange(response.Select(document => document.Index));
+
+                if ((response.Diagnostics is CosmosTraceDiagnostics traceDiagnostics) &&
+                    traceDiagnostics.Value.TryGetDatum(FullTextScoreStatsCacheStatusDatum, out object cacheStatus) &&
+                    (cacheStatus is string cacheStatusText))
+                {
+                    cacheStatuses.Add(cacheStatusText);
+                }
+            }
+
+            return (indices, cacheStatuses);
         }
 
         private static async Task<CosmosArray> LoadDocuments()

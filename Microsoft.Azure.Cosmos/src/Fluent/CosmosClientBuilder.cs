@@ -388,6 +388,23 @@ namespace Microsoft.Azure.Cosmos.Fluent
         }
 
         /// <summary>
+        /// Sets the cache time to live for cached global full text search statistics.
+        /// </summary>
+        /// <param name="fullTextScoreStatsCacheTtl">A time to use as the cache time to live.</param>
+        /// <returns>The current <see cref="CosmosClientBuilder"/>.</returns>
+        /// <seealso cref="CosmosClientOptions.FullTextScoreStatsCacheTtl"/>
+#if PREVIEW
+        public
+#else
+        internal
+#endif
+        CosmosClientBuilder WithFullTextScoreStatsCacheTtl(TimeSpan fullTextScoreStatsCacheTtl)
+        {
+            this.clientOptions.FullTextScoreStatsCacheTtl = fullTextScoreStatsCacheTtl;
+            return this;
+        }
+
+        /// <summary>
         /// Sets the request timeout for inference service operations (e.g., semantic reranking).
         /// This is a single-attempt timeout with no retries; if the request does not complete
         /// within the specified duration, a <see cref="CosmosException"/> with status 408 (Request Timeout) is thrown.
