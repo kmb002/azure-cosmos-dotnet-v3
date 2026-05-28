@@ -16,6 +16,7 @@ namespace Microsoft.Azure.Cosmos.Query
     using Microsoft.Azure.Cosmos.Query.Core.ExecutionContext;
     using Microsoft.Azure.Cosmos.Query.Core.Monads;
     using Microsoft.Azure.Cosmos.Query.Core.Pipeline;
+    using Microsoft.Azure.Cosmos.Query.Core.Pipeline.CrossPartition.HybridSearch;
     using Microsoft.Azure.Cosmos.Query.Core.Pipeline.Pagination;
     using Microsoft.Azure.Cosmos.Query.Core.QueryClient;
     using Microsoft.Azure.Cosmos.Query.Core.QueryPlan;
@@ -110,6 +111,11 @@ namespace Microsoft.Azure.Cosmos.Query
                 resourceType: resourceType);
             DocumentContainer documentContainer = new DocumentContainer(networkAttachedDocumentContainer);
 
+            FullTextScoreStatsCacheContext fullTextScoreStatsCacheContext = new FullTextScoreStatsCacheContext(
+                clientContext.FullTextScoreStatsCache,
+                containerCore.Database.Id,
+                containerCore.Id);
+
             CosmosElement requestContinuationToken;
             if (continuationToken != null)
             {
@@ -152,7 +158,8 @@ namespace Microsoft.Azure.Cosmos.Query
                 isHybridSearchQueryPlanOptimizationDisabled: queryRequestOptions.IsHybridSearchQueryPlanOptimizationDisabled,
                 enableDistributedQueryGatewayMode: queryRequestOptions.EnableDistributedQueryGatewayMode && (clientContext.ClientOptions.ConnectionMode == ConnectionMode.Gateway),
                 fullTextScoreScope: queryRequestOptions.FullTextScoreScope,
-                testInjections: queryRequestOptions.TestSettings);
+                testInjections: queryRequestOptions.TestSettings,
+                fullTextScoreStatsCacheContext: fullTextScoreStatsCacheContext);
 
             return new QueryIterator(
                 cosmosQueryContext,

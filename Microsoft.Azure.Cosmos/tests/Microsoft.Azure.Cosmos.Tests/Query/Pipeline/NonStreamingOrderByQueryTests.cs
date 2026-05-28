@@ -18,6 +18,7 @@ namespace Microsoft.Azure.Cosmos.Tests.Query.Pipeline
     using Microsoft.Azure.Cosmos.Query.Core;
     using Microsoft.Azure.Cosmos.Query.Core.Monads;
     using Microsoft.Azure.Cosmos.Query.Core.Pipeline;
+    using Microsoft.Azure.Cosmos.Query.Core.Pipeline.CrossPartition.HybridSearch;
     using Microsoft.Azure.Cosmos.Query.Core.Pipeline.CrossPartition.OrderBy;
     using Microsoft.Azure.Cosmos.Query.Core.Pipeline.Distinct;
     using Microsoft.Azure.Cosmos.Query.Core.Pipeline.Pagination;
@@ -853,6 +854,305 @@ namespace Microsoft.Azure.Cosmos.Tests.Query.Pipeline
             return RunParityTests(documentContainer, nonStreamingDocumentContainer, testCases, TestOptions.Default);
         }
 
+        [TestMethod]
+        public async Task FullTextScoreStatsCacheHitReturnsSyntheticLeadingPageTest()
+        {
+            IReadOnlyList<FeedRangeEpk> allRanges = new List<FeedRangeEpk>()
+            {
+                new FeedRangeEpk(new Documents.Routing.Range<string>("A", "B", true, false)),
+                new FeedRangeEpk(new Documents.Routing.Range<string>("B", "C", true, false)),
+            };
+
+            MockDocumentContainer documentContainer = MockDocumentContainer.CreateHybridSearchContainer(
+                allRanges,
+                Enumerable.Repeat(PartitionedFeedMode.NonStreaming, allRanges.Count).ToArray(),
+                leafPageCount: 2,
+                backendPageSize: 2,
+                returnEmptyGlobalStatistics: false,
+                skipOrderByRewrite: false);
+
+            FullTextScoreStatsCache cache = new FullTextScoreStatsCache(TimeSpan.FromMinutes(5));
+            FullTextScoreStatsCacheContext cacheContext = new FullTextScoreStatsCacheContext(cache, "db", "container");
+            HybridSearchQueryInfo hybridSearchQueryInfo = Create2ItemHybridSearchQueryInfo(
+                requiresGlobalStatistics: true,
+                skip: null,
+                take: null,
+                weights: null);
+
+            TryCatch<IQueryPipelineStage> warmPipeline = PipelineFactory.MonadicCreate(
+                documentContainer,
+                Create2ItemSqlQuerySpec(),
+                allRanges,
+                partitionKey: null,
+                queryInfo: null,
+                hybridSearchQueryInfo: hybridSearchQueryInfo,
+                maxItemCount: 10,
+                new ContainerQueryProperties(),
+                allRanges,
+                isContinuationExpected: true,
+                maxConcurrency: MaxConcurrency,
+                fullTextScoreScope: FullTextScoreScope.Global,
+                requestContinuationToken: null,
+                fullTextScoreStatsCacheContext: cacheContext);
+
+            Assert.IsTrue(warmPipeline.Succeeded);
+            await RunPipelineStage(warmPipeline.Result, 10);
+
+            TryCatch<IQueryPipelineStage> hitPipeline = PipelineFactory.MonadicCreate(
+                documentContainer,
+                Create2ItemSqlQuerySpec(),
+                allRanges,
+                partitionKey: null,
+                queryInfo: null,
+                hybridSearchQueryInfo: hybridSearchQueryInfo,
+                maxItemCount: 10,
+                new ContainerQueryProperties(),
+                allRanges,
+                isContinuationExpected: true,
+                maxConcurrency: MaxConcurrency,
+                fullTextScoreScope: FullTextScoreScope.Global,
+                requestContinuationToken: null,
+                fullTextScoreStatsCacheContext: cacheContext);
+
+            Assert.IsTrue(hitPipeline.Succeeded);
+            Assert.IsTrue(await hitPipeline.Result.MoveNextAsync(NoOpTrace.Singleton, default));
+            Assert.IsTrue(hitPipeline.Result.Current.Succeeded);
+            Assert.AreEqual(0, hitPipeline.Result.Current.Result.RequestCharge);
+            Assert.AreEqual(0, hitPipeline.Result.Current.Result.Documents.Count);
+            Assert.AreEqual("HybridSearchInProgress", ((CosmosString)hitPipeline.Result.Current.Result.State.Value).Value);
+        }
+
+        [TestMethod]
+        public async Task FullTextScoreStatsCacheAddsHitAndMissDiagnosticsTest()
+        {
+            IReadOnlyList<FeedRangeEpk> allRanges = new List<FeedRangeEpk>()
+            {
+                new FeedRangeEpk(new Documents.Routing.Range<string>("A", "B", true, false)),
+                new FeedRangeEpk(new Documents.Routing.Range<string>("B", "C", true, false)),
+            };
+
+            MockDocumentContainer documentContainer = MockDocumentContainer.CreateHybridSearchContainer(
+                allRanges,
+                Enumerable.Repeat(PartitionedFeedMode.NonStreaming, allRanges.Count).ToArray(),
+                leafPageCount: 2,
+                backendPageSize: 2,
+                returnEmptyGlobalStatistics: false,
+                skipOrderByRewrite: false);
+
+            FullTextScoreStatsCache cache = new FullTextScoreStatsCache(TimeSpan.FromMinutes(5));
+            FullTextScoreStatsCacheContext cacheContext = new FullTextScoreStatsCacheContext(cache, "db", "container");
+            HybridSearchQueryInfo hybridSearchQueryInfo = Create2ItemHybridSearchQueryInfo(
+                requiresGlobalStatistics: true,
+                skip: null,
+                take: null,
+                weights: null);
+
+            using ITrace missTrace = Microsoft.Azure.Cosmos.Tracing.Trace.GetRootTrace("HybridSearchGlobalStatisticsCacheMiss");
+            TryCatch<IQueryPipelineStage> missPipeline = PipelineFactory.MonadicCreate(
+                documentContainer,
+                Create2ItemSqlQuerySpec(),
+                allRanges,
+                partitionKey: null,
+                queryInfo: null,
+                hybridSearchQueryInfo: hybridSearchQueryInfo,
+                maxItemCount: 10,
+                new ContainerQueryProperties(),
+                allRanges,
+                isContinuationExpected: true,
+                maxConcurrency: MaxConcurrency,
+                fullTextScoreScope: FullTextScoreScope.Global,
+                requestContinuationToken: null,
+                fullTextScoreStatsCacheContext: cacheContext);
+
+            Assert.IsTrue(missPipeline.Succeeded);
+            Assert.IsTrue(await missPipeline.Result.MoveNextAsync(missTrace, default));
+            Assert.IsTrue(missTrace.TryGetDatum("BM25FullTextScoreStatsCacheStatus", out object missStatus));
+            Assert.AreEqual("Miss", missStatus);
+
+            using ITrace hitTrace = Microsoft.Azure.Cosmos.Tracing.Trace.GetRootTrace("HybridSearchGlobalStatisticsCacheHit");
+            TryCatch<IQueryPipelineStage> hitPipeline = PipelineFactory.MonadicCreate(
+                documentContainer,
+                Create2ItemSqlQuerySpec(),
+                allRanges,
+                partitionKey: null,
+                queryInfo: null,
+                hybridSearchQueryInfo: hybridSearchQueryInfo,
+                maxItemCount: 10,
+                new ContainerQueryProperties(),
+                allRanges,
+                isContinuationExpected: true,
+                maxConcurrency: MaxConcurrency,
+                fullTextScoreScope: FullTextScoreScope.Global,
+                requestContinuationToken: null,
+                fullTextScoreStatsCacheContext: cacheContext);
+
+            Assert.IsTrue(hitPipeline.Succeeded);
+            Assert.IsTrue(await hitPipeline.Result.MoveNextAsync(hitTrace, default));
+            Assert.IsTrue(hitTrace.TryGetDatum("BM25FullTextScoreStatsCacheStatus", out object hitStatus));
+            Assert.AreEqual("Hit", hitStatus);
+        }
+
+        [TestMethod]
+        public async Task FullTextScoreStatsCacheLocalScopeBypassesCacheTest()
+        {
+            IReadOnlyList<FeedRangeEpk> allRanges = new List<FeedRangeEpk>()
+            {
+                new FeedRangeEpk(new Documents.Routing.Range<string>("A", "B", true, false)),
+                new FeedRangeEpk(new Documents.Routing.Range<string>("B", "C", true, false)),
+            };
+
+            MockDocumentContainer documentContainer = MockDocumentContainer.CreateHybridSearchContainer(
+                allRanges,
+                Enumerable.Repeat(PartitionedFeedMode.NonStreaming, allRanges.Count).ToArray(),
+                leafPageCount: 2,
+                backendPageSize: 2,
+                returnEmptyGlobalStatistics: false,
+                skipOrderByRewrite: false);
+
+            FullTextScoreStatsCache cache = new FullTextScoreStatsCache(TimeSpan.FromMinutes(5));
+            FullTextScoreStatsCacheContext cacheContext = new FullTextScoreStatsCacheContext(cache, "db", "container");
+            HybridSearchQueryInfo hybridSearchQueryInfo = Create2ItemHybridSearchQueryInfo(
+                requiresGlobalStatistics: true,
+                skip: null,
+                take: null,
+                weights: null);
+
+            for (int i = 0; i < 2; i++)
+            {
+                TryCatch<IQueryPipelineStage> pipeline = PipelineFactory.MonadicCreate(
+                    documentContainer,
+                    Create2ItemSqlQuerySpec(),
+                    allRanges,
+                    partitionKey: null,
+                    queryInfo: null,
+                    hybridSearchQueryInfo: hybridSearchQueryInfo,
+                    maxItemCount: 10,
+                    new ContainerQueryProperties(),
+                    allRanges,
+                    isContinuationExpected: true,
+                    maxConcurrency: MaxConcurrency,
+                    fullTextScoreScope: FullTextScoreScope.Local,
+                    requestContinuationToken: null,
+                    fullTextScoreStatsCacheContext: cacheContext);
+
+                Assert.IsTrue(pipeline.Succeeded);
+                await RunPipelineStage(pipeline.Result, 10);
+            }
+
+            Assert.AreEqual(allRanges.Count * 2, documentContainer.StatisticsQueryCount);
+        }
+
+        [TestMethod]
+        public void FullTextScoreStatsCacheKeySeparatesContainerIdentityTest()
+        {
+            SqlParameterCollection parameters = new SqlParameterCollection(new[]
+            {
+                new SqlParameter("@distance", 2),
+                new SqlParameter("@term", "swim"),
+            });
+
+            string key1 = FullTextScoreStatsCache.CreateCacheKey(
+                databaseId: "db1",
+                containerId: "container",
+                globalStatisticsQueryText: "SELECT VALUE @term FROM c WHERE c.distance = @distance",
+                parameters: parameters);
+
+            string key2 = FullTextScoreStatsCache.CreateCacheKey(
+                databaseId: "db2",
+                containerId: "container",
+                globalStatisticsQueryText: "SELECT VALUE @term FROM c WHERE c.distance = @distance",
+                parameters: parameters);
+
+            string key3 = FullTextScoreStatsCache.CreateCacheKey(
+                databaseId: "db1",
+                containerId: "container2",
+                globalStatisticsQueryText: "SELECT VALUE @term FROM c WHERE c.distance = @distance",
+                parameters: parameters);
+
+            Assert.AreNotEqual(key1, key2);
+            Assert.AreNotEqual(key1, key3);
+        }
+
+        [TestMethod]
+        public void FullTextScoreStatsCacheKeyUsesEquivalentInputsTest()
+        {
+            SqlParameterCollection parameters1 = new SqlParameterCollection(new[]
+            {
+                new SqlParameter("@distance", 2),
+                new SqlParameter("@term", "swim"),
+            });
+
+            SqlParameterCollection parameters2 = new SqlParameterCollection(new[]
+            {
+                new SqlParameter("@distance", 2),
+                new SqlParameter("@term", "swim"),
+            });
+
+            string key1 = FullTextScoreStatsCache.CreateCacheKey(
+                databaseId: "db",
+                containerId: "container",
+                globalStatisticsQueryText: "SELECT VALUE @term FROM c WHERE c.distance = @distance",
+                parameters: parameters1);
+
+            string key2 = FullTextScoreStatsCache.CreateCacheKey(
+                databaseId: "db",
+                containerId: "container",
+                globalStatisticsQueryText: "SELECT VALUE @term FROM c WHERE c.distance = @distance",
+                parameters: parameters2);
+
+            Assert.AreEqual(key1, key2);
+        }
+
+        [TestMethod]
+        public async Task FullTextScoreStatsCacheExpiredEntryDoesNotGetReusedTest()
+        {
+            IReadOnlyList<FeedRangeEpk> allRanges = new List<FeedRangeEpk>()
+            {
+                new FeedRangeEpk(new Documents.Routing.Range<string>("A", "B", true, false)),
+                new FeedRangeEpk(new Documents.Routing.Range<string>("B", "C", true, false)),
+            };
+
+            MockDocumentContainer documentContainer = MockDocumentContainer.CreateHybridSearchContainer(
+                allRanges,
+                Enumerable.Repeat(PartitionedFeedMode.NonStreaming, allRanges.Count).ToArray(),
+                leafPageCount: 2,
+                backendPageSize: 2,
+                returnEmptyGlobalStatistics: false,
+                skipOrderByRewrite: false);
+
+            FullTextScoreStatsCache cache = new FullTextScoreStatsCache(TimeSpan.Zero);
+            FullTextScoreStatsCacheContext cacheContext = new FullTextScoreStatsCacheContext(cache, "db", "container");
+            HybridSearchQueryInfo hybridSearchQueryInfo = Create2ItemHybridSearchQueryInfo(
+                requiresGlobalStatistics: true,
+                skip: null,
+                take: null,
+                weights: null);
+
+            for (int i = 0; i < 2; i++)
+            {
+                TryCatch<IQueryPipelineStage> pipeline = PipelineFactory.MonadicCreate(
+                    documentContainer,
+                    Create2ItemSqlQuerySpec(),
+                    allRanges,
+                    partitionKey: null,
+                    queryInfo: null,
+                    hybridSearchQueryInfo: hybridSearchQueryInfo,
+                    maxItemCount: 10,
+                    new ContainerQueryProperties(),
+                    allRanges,
+                    isContinuationExpected: true,
+                    maxConcurrency: MaxConcurrency,
+                    fullTextScoreScope: FullTextScoreScope.Global,
+                    requestContinuationToken: null,
+                    fullTextScoreStatsCacheContext: cacheContext);
+
+                Assert.IsTrue(pipeline.Succeeded);
+                await RunPipelineStage(pipeline.Result, 10);
+            }
+
+            Assert.AreEqual(allRanges.Count * 2, documentContainer.StatisticsQueryCount);
+        }
+
         private static async Task RunParityTests(
             IDocumentContainer documentContainer,
             IDocumentContainer nonStreamingDocumentContainer,
@@ -1626,6 +1926,8 @@ namespace Microsoft.Azure.Cosmos.Tests.Query.Pipeline
             private int queryCount;
 
             public IReadOnlyList<FeedRange> StatisticsQueryRanges => this.statisticsQueryRanges;
+
+            public int StatisticsQueryCount => Interlocked.CompareExchange(ref this.statisticsQueryCount, 0, 0);
 
             public double TotalRequestCharge
             {

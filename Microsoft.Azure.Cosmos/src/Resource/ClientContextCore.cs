@@ -16,6 +16,7 @@ namespace Microsoft.Azure.Cosmos
     using System.Threading.Tasks;
     using Microsoft.Azure.Cosmos.Core.Trace;
     using Microsoft.Azure.Cosmos.Handlers;
+    using Microsoft.Azure.Cosmos.Query.Core.Pipeline.CrossPartition.HybridSearch;
     using Microsoft.Azure.Cosmos.Resource.CosmosExceptions;
     using Microsoft.Azure.Cosmos.Routing;
     using Microsoft.Azure.Cosmos.Telemetry;
@@ -32,6 +33,7 @@ namespace Microsoft.Azure.Cosmos
         private readonly CosmosResponseFactoryInternal responseFactory;
         private readonly RequestInvokerHandler requestHandler;
         private readonly CosmosClientOptions clientOptions;
+        private readonly FullTextScoreStatsCache fullTextScoreStatsCache;
 
         private readonly string userAgent;
         private bool isDisposed = false;
@@ -45,7 +47,8 @@ namespace Microsoft.Azure.Cosmos
             RequestInvokerHandler requestHandler,
             DocumentClient documentClient,
             string userAgent,
-            BatchAsyncContainerExecutorCache batchExecutorCache)
+            BatchAsyncContainerExecutorCache batchExecutorCache,
+            FullTextScoreStatsCache fullTextScoreStatsCache)
         {
             this.client = client;
             this.clientOptions = clientOptions;
@@ -55,6 +58,7 @@ namespace Microsoft.Azure.Cosmos
             this.documentClient = documentClient;
             this.userAgent = userAgent;
             this.batchExecutorCache = batchExecutorCache;
+            this.fullTextScoreStatsCache = fullTextScoreStatsCache;
         }
 
         internal static CosmosClientContext Create(
@@ -152,7 +156,8 @@ namespace Microsoft.Azure.Cosmos
                 requestHandler: requestInvokerHandler,
                 documentClient: documentClient,
                 userAgent: documentClient.ConnectionPolicy.UserAgentContainer.UserAgent,
-                batchExecutorCache: new BatchAsyncContainerExecutorCache());
+                batchExecutorCache: new BatchAsyncContainerExecutorCache(),
+                fullTextScoreStatsCache: new FullTextScoreStatsCache(clientOptions.FullTextScoreStatsCacheTtl));
         }
 
         /// <summary>
@@ -169,6 +174,8 @@ namespace Microsoft.Azure.Cosmos
         internal override RequestInvokerHandler RequestHandler => this.ThrowIfDisposed(this.requestHandler);
 
         internal override CosmosClientOptions ClientOptions => this.ThrowIfDisposed(this.clientOptions);
+
+        internal override FullTextScoreStatsCache FullTextScoreStatsCache => this.ThrowIfDisposed(this.fullTextScoreStatsCache);
 
         internal override string UserAgent => this.ThrowIfDisposed(this.userAgent);
 

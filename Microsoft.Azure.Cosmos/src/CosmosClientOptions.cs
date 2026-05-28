@@ -65,6 +65,7 @@ namespace Microsoft.Azure.Cosmos
         private System.Text.Json.JsonSerializerOptions stjSerializerOptions;
 
         private ConnectionMode connectionMode;
+        private TimeSpan? fullTextScoreStatsCacheTtl;
         private Protocol connectionProtocol;
         private TimeSpan? idleTcpConnectionTimeout;
         private TimeSpan? openTcpConnectionTimeout;
@@ -316,6 +317,35 @@ namespace Microsoft.Azure.Cosmos
         /// <value>Default value is 6 seconds.</value>
         /// <seealso cref="CosmosClientBuilder.WithRequestTimeout(TimeSpan)"/>
         public TimeSpan RequestTimeout { get; set; }
+
+        /// <summary>
+        /// Gets or sets the cache time to live for cached global full text search statistics.
+        /// </summary>
+        /// <remarks>
+        /// Setting this property enables the per-<see cref="CosmosClient"/> in-memory cache for
+        /// <see cref="FullTextScoreScope.Global"/> statistics. The value must be between 5 and 15 minutes inclusive.
+        /// </remarks>
+        public TimeSpan? FullTextScoreStatsCacheTtl
+        {
+            get => this.fullTextScoreStatsCacheTtl;
+            set
+            {
+                if (value.HasValue)
+                {
+                    if (value.Value < TimeSpan.FromMinutes(5))
+                    {
+                        throw new ArgumentOutOfRangeException(nameof(value), "The full text score statistics cache TTL must be at least 5 minutes.");
+                    }
+
+                    if (value.Value > TimeSpan.FromMinutes(15))
+                    {
+                        throw new ArgumentOutOfRangeException(nameof(value), "The full text score statistics cache TTL must be at most 15 minutes.");
+                    }
+                }
+
+                this.fullTextScoreStatsCacheTtl = value;
+            }
+        }
 
         /// <summary>
         /// Gets or sets the request timeout for inference service operations (e.g., semantic reranking).
@@ -643,7 +673,7 @@ namespace Microsoft.Azure.Cosmos
         /// Together with MaxRequestsPerTcpConnection, this setting limits the number of requests that are simultaneously sent to a single Cosmos DB back-end(MaxRequestsPerTcpConnection x MaxTcpConnectionPerEndpoint).
         /// </summary>
         /// <value>
-        /// The default value is 65,535. Any positive value is accepted, allowing applications to constrain the connection pool size when needed; values of 16 or greater are recommended.
+        /// The default value is 65,535. Value must be greater than or equal to 16.
         /// </value>
         public int? MaxTcpConnectionsPerEndpoint
         {

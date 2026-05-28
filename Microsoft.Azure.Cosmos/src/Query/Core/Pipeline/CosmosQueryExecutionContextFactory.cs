@@ -18,6 +18,7 @@ namespace Microsoft.Azure.Cosmos.Query.Core.ExecutionContext
     using Microsoft.Azure.Cosmos.Query.Core.Monads;
     using Microsoft.Azure.Cosmos.Query.Core.Parser;
     using Microsoft.Azure.Cosmos.Query.Core.Pipeline;
+    using Microsoft.Azure.Cosmos.Query.Core.Pipeline.CrossPartition.HybridSearch;
     using Microsoft.Azure.Cosmos.Query.Core.Pipeline.CrossPartition.Parallel;
     using Microsoft.Azure.Cosmos.Query.Core.Pipeline.OptimisticDirectExecutionQuery;
     using Microsoft.Azure.Cosmos.Query.Core.Pipeline.Pagination;
@@ -568,7 +569,8 @@ namespace Microsoft.Azure.Cosmos.Query.Core.ExecutionContext
                 isContinuationExpected: cosmosQueryContext.IsContinuationExpected,
                 maxConcurrency: inputParameters.MaxConcurrency,
                 fullTextScoreScope: inputParameters.FullTextScoreScope,
-                requestContinuationToken: inputParameters.InitialUserContinuationToken);
+                requestContinuationToken: inputParameters.InitialUserContinuationToken,
+                fullTextScoreStatsCacheContext: inputParameters.FullTextScoreStatsCacheContext);
         }
 
         private static async Task<PartitionedQueryExecutionInfo> GetPartitionedQueryExecutionInfoAsync(
@@ -840,7 +842,8 @@ namespace Microsoft.Azure.Cosmos.Query.Core.ExecutionContext
                 bool isHybridSearchQueryPlanOptimizationDisabled,
                 bool enableDistributedQueryGatewayMode,
                 FullTextScoreScope fullTextScoreScope,
-                TestInjections testInjections)
+                TestInjections testInjections,
+                FullTextScoreStatsCacheContext fullTextScoreStatsCacheContext)
             {
                 this.SqlQuerySpec = sqlQuerySpec ?? throw new ArgumentNullException(nameof(sqlQuerySpec));
                 this.InitialUserContinuationToken = initialUserContinuationToken;
@@ -857,6 +860,7 @@ namespace Microsoft.Azure.Cosmos.Query.Core.ExecutionContext
                 this.EnableDistributedQueryGatewayMode = enableDistributedQueryGatewayMode;
                 this.FullTextScoreScope = fullTextScoreScope;
                 this.TestInjections = testInjections;
+                this.FullTextScoreStatsCacheContext = fullTextScoreStatsCacheContext;
             }
 
             public static InputParameters Create(
@@ -874,7 +878,8 @@ namespace Microsoft.Azure.Cosmos.Query.Core.ExecutionContext
                 bool isHybridSearchQueryPlanOptimizationDisabled,
                 bool enableDistributedQueryGatewayMode,
                 FullTextScoreScope fullTextScoreScope,
-                TestInjections testInjections)
+                TestInjections testInjections,
+                FullTextScoreStatsCacheContext fullTextScoreStatsCacheContext = null)
             {
                 if (sqlQuerySpec == null)
                 {
@@ -914,7 +919,8 @@ namespace Microsoft.Azure.Cosmos.Query.Core.ExecutionContext
                     isHybridSearchQueryPlanOptimizationDisabled: isHybridSearchQueryPlanOptimizationDisabled,
                     enableDistributedQueryGatewayMode: enableDistributedQueryGatewayMode,
                     fullTextScoreScope: fullTextScoreScope,
-                    testInjections: testInjections);
+                    testInjections: testInjections,
+                    fullTextScoreStatsCacheContext: fullTextScoreStatsCacheContext);
             }
 
             public SqlQuerySpec SqlQuerySpec { get; }
@@ -933,6 +939,7 @@ namespace Microsoft.Azure.Cosmos.Query.Core.ExecutionContext
             public bool EnableDistributedQueryGatewayMode { get; }
             public bool UseLengthAwareRangeComparer { get; }
             public FullTextScoreScope FullTextScoreScope { get; }
+            public FullTextScoreStatsCacheContext FullTextScoreStatsCacheContext { get; }
 
             public InputParameters WithContinuationToken(CosmosElement token)
             {
@@ -951,7 +958,8 @@ namespace Microsoft.Azure.Cosmos.Query.Core.ExecutionContext
                     this.IsHybridSearchQueryPlanOptimizationDisabled,
                     this.EnableDistributedQueryGatewayMode,
                     this.FullTextScoreScope,
-                    this.TestInjections);
+                    this.TestInjections,
+                    this.FullTextScoreStatsCacheContext);
             }
         }
 

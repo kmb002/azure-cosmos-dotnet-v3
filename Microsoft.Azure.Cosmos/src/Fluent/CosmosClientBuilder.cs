@@ -388,6 +388,18 @@ namespace Microsoft.Azure.Cosmos.Fluent
         }
 
         /// <summary>
+        /// Sets the cache time to live for cached global full text search statistics.
+        /// </summary>
+        /// <param name="fullTextScoreStatsCacheTtl">A time to use as the cache time to live.</param>
+        /// <returns>The current <see cref="CosmosClientBuilder"/>.</returns>
+        /// <seealso cref="CosmosClientOptions.FullTextScoreStatsCacheTtl"/>
+        public CosmosClientBuilder WithFullTextScoreStatsCacheTtl(TimeSpan fullTextScoreStatsCacheTtl)
+        {
+            this.clientOptions.FullTextScoreStatsCacheTtl = fullTextScoreStatsCacheTtl;
+            return this;
+        }
+
+        /// <summary>
         /// Sets the request timeout for inference service operations (e.g., semantic reranking).
         /// This is a single-attempt timeout with no retries; if the request does not complete
         /// within the specified duration, a <see cref="CosmosException"/> with status 408 (Request Timeout) is thrown.
@@ -447,7 +459,7 @@ namespace Microsoft.Azure.Cosmos.Fluent
         /// <param name="maxTcpConnectionsPerEndpoint">
         /// Controls the maximum number of TCP connections that may be opened to each Cosmos DB back-end.
         /// Together with MaxRequestsPerTcpConnection, this setting limits the number of requests that are simultaneously sent to a single Cosmos DB back-end(MaxRequestsPerTcpConnection x MaxTcpConnectionPerEndpoint).
-        /// The default value is 65,535. Any positive value is accepted, allowing applications to constrain the connection pool size when needed; values of 16 or greater are recommended.
+        /// The default value is 65,535. Value must be greater than or equal to 16.
         /// </param>
         /// <param name="portReuseMode">
         /// (Direct/TCP) Controls the client port reuse policy used by the transport stack.

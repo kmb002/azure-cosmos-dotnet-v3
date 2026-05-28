@@ -37,6 +37,7 @@ namespace Microsoft.Azure.Cosmos.Tests
             string region = Regions.WestCentralUS;
             ConnectionMode connectionMode = ConnectionMode.Gateway;
             TimeSpan requestTimeout = TimeSpan.FromDays(1);
+            TimeSpan fullTextScoreStatsCacheTtl = TimeSpan.FromMinutes(10);
             int maxConnections = 9001;
             string userAgentSuffix = "testSuffix";
             RequestHandler preProcessHandler = new TestHandler();
@@ -75,6 +76,7 @@ namespace Microsoft.Azure.Cosmos.Tests
             Assert.AreNotEqual(connectionMode, clientOptions.ConnectionMode);
             Assert.AreNotEqual(maxConnections, clientOptions.GatewayModeMaxConnectionLimit);
             Assert.AreNotEqual(requestTimeout, clientOptions.RequestTimeout);
+            Assert.IsNull(clientOptions.FullTextScoreStatsCacheTtl);
             Assert.AreNotEqual(userAgentSuffix, clientOptions.ApplicationName);
             Assert.AreNotEqual(apiType, clientOptions.ApiType);
             Assert.IsFalse(clientOptions.AllowBulkExecution);
@@ -118,6 +120,7 @@ namespace Microsoft.Azure.Cosmos.Tests
             cosmosClientBuilder.WithApplicationRegion(region)
                 .WithConnectionModeGateway(maxConnections, webProxy)
                 .WithRequestTimeout(requestTimeout)
+                .WithFullTextScoreStatsCacheTtl(fullTextScoreStatsCacheTtl)
                 .WithApplicationName(userAgentSuffix)
                 .AddCustomHandlers(preProcessHandler)
                 .WithApiType(apiType)
@@ -138,6 +141,7 @@ namespace Microsoft.Azure.Cosmos.Tests
             Assert.AreEqual(connectionMode, clientOptions.ConnectionMode);
             Assert.AreEqual(maxConnections, clientOptions.GatewayModeMaxConnectionLimit);
             Assert.AreEqual(requestTimeout, clientOptions.RequestTimeout);
+            Assert.AreEqual(fullTextScoreStatsCacheTtl, clientOptions.FullTextScoreStatsCacheTtl);
             Assert.AreEqual(userAgentSuffix, clientOptions.ApplicationName);
             Assert.AreEqual(preProcessHandler, clientOptions.CustomHandlers[0]);
             Assert.AreEqual(apiType, clientOptions.ApiType);
@@ -225,6 +229,21 @@ namespace Microsoft.Azure.Cosmos.Tests
             Assert.IsTrue(policy.EnableTcpConnectionEndpointRediscovery);
             CollectionAssert.AreEqual(preferredLocations.ToArray(), policy.PreferredLocations.ToArray());
             CollectionAssert.AreEqual(regionalEndpoints.ToArray(), policy.AccountInitializationCustomEndpoints.ToArray());
+        }
+
+        [TestMethod]
+        public void VerifyFullTextScoreStatsCacheTtlValidation()
+        {
+            CosmosClientOptions options = new CosmosClientOptions();
+
+            options.FullTextScoreStatsCacheTtl = TimeSpan.FromMinutes(5);
+            Assert.AreEqual(TimeSpan.FromMinutes(5), options.FullTextScoreStatsCacheTtl);
+
+            options.FullTextScoreStatsCacheTtl = TimeSpan.FromMinutes(15);
+            Assert.AreEqual(TimeSpan.FromMinutes(15), options.FullTextScoreStatsCacheTtl);
+
+            Assert.ThrowsException<ArgumentOutOfRangeException>(() => options.FullTextScoreStatsCacheTtl = TimeSpan.FromMinutes(4));
+            Assert.ThrowsException<ArgumentOutOfRangeException>(() => options.FullTextScoreStatsCacheTtl = TimeSpan.FromMinutes(16));
         }
 
         [TestMethod]

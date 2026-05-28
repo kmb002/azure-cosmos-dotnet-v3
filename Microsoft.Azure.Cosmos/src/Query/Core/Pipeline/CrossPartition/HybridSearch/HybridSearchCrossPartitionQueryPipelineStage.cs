@@ -27,6 +27,13 @@ namespace Microsoft.Azure.Cosmos.Query.Core.Pipeline.CrossPartition.HybridSearch
         private delegate TryCatch<IQueryPipelineStage> HybridSearchComponentPipelineFactory(QueryInfo queryInfo);
 
         private const int RrfConstant = 60;
+        private const string FullTextScoreStatsCacheTraceName = "BM25 FullTextScoreStatsCache";
+        private const string FullTextScoreStatsCacheStatusDatum = "CacheStatus";
+        private const string FullTextScoreStatsCacheReasonDatum = "CacheReason";
+        private const string FullTextScoreStatsCacheRootStatusDatum = "BM25FullTextScoreStatsCacheStatus";
+        private const string FullTextScoreStatsCacheRootReasonDatum = "BM25FullTextScoreStatsCacheReason";
+        private const string FullTextScoreStatsCacheHit = "Hit";
+        private const string FullTextScoreStatsCacheMiss = "Miss";
 
         private const int MaximumPageSize = 2048;
 
@@ -41,6 +48,8 @@ namespace Microsoft.Azure.Cosmos.Query.Core.Pipeline.CrossPartition.HybridSearch
         private readonly int maxConcurrency;
 
         private readonly HybridSearchComponentPipelineFactory pipelineFactory;
+        private readonly FullTextScoreStatsCache fullTextScoreStatsCache;
+        private readonly string fullTextScoreStatsCacheKey;
 
         private readonly IQueryPipelineStage globalStatisticsPipeline;
 
@@ -71,13 +80,17 @@ namespace Microsoft.Azure.Cosmos.Query.Core.Pipeline.CrossPartition.HybridSearch
             int maxConcurrency,
             State state,
             IQueryPipelineStage globalStatisticsPipeline,
-            IReadOnlyList<IQueryPipelineStage> queryPipelineStages)
+            IReadOnlyList<IQueryPipelineStage> queryPipelineStages,
+            FullTextScoreStatsCache fullTextScoreStatsCache,
+            string fullTextScoreStatsCacheKey)
         {
             this.hybridSearchQueryInfo = hybridSearchQueryInfo ?? throw new ArgumentNullException(nameof(hybridSearchQueryInfo));
             this.pipelineFactory = pipelineFactory ?? throw new ArgumentNullException(nameof(pipelineFactory));
             this.pageSize = pageSize;
             this.maxConcurrency = maxConcurrency;
             this.state = state;
+            this.fullTextScoreStatsCache = fullTextScoreStatsCache;
+            this.fullTextScoreStatsCacheKey = fullTextScoreStatsCacheKey;
             this.globalStatisticsPipeline = globalStatisticsPipeline;
             this.queryPipelineStages = queryPipelineStages;
         }
@@ -93,7 +106,8 @@ namespace Microsoft.Azure.Cosmos.Query.Core.Pipeline.CrossPartition.HybridSearch
             int maxItemCount,
             bool isContinuationExpected,
             int maxConcurrency,
-            Cosmos.FullTextScoreScope fullTextScoreScope)
+            Cosmos.FullTextScoreScope fullTextScoreScope,
+            FullTextScoreStatsCacheContext fullTextScoreStatsCacheContext = null)
         {
             TryCatch<IQueryPipelineStage> ComponentPipelineFactory(QueryInfo rewrittenQueryInfo)
             {
@@ -115,6 +129,7 @@ namespace Microsoft.Azure.Cosmos.Query.Core.Pipeline.CrossPartition.HybridSearch
             }
 
             State state;
+            string fullTextScoreStatsCacheKey = null;
             IQueryPipelineStage globalStatisticsPipeline;
             List<IQueryPipelineStage> queryPipelineStages;
             if (queryInfo.RequiresGlobalStatistics)
@@ -130,6 +145,16 @@ namespace Microsoft.Azure.Cosmos.Query.Core.Pipeline.CrossPartition.HybridSearch
                 IReadOnlyList<FeedRangeEpk> statisticsTargetRanges = fullTextScoreScope == Cosmos.FullTextScoreScope.Global
                     ? allRanges
                     : targetRanges;
+
+                if ((fullTextScoreScope == Cosmos.FullTextScoreScope.Global) &&
+                    (fullTextScoreStatsCacheContext?.Cache?.IsEnabled == true))
+                {
+                    fullTextScoreStatsCacheKey = FullTextScoreStatsCache.CreateCacheKey(
+                        fullTextScoreStatsCacheContext.DatabaseId,
+                        fullTextScoreStatsCacheContext.ContainerId,
+                        globalStatisticsQuerySpec.QueryText,
+                        globalStatisticsQuerySpec.Parameters);
+                }
 
                 TryCatch<IQueryPipelineStage> tryCatchGlobalStatisticsPipeline = ParallelCrossPartitionQueryPipelineStage.MonadicCreate(
                     documentContainer: documentContainer,
@@ -179,7 +204,9 @@ namespace Microsoft.Azure.Cosmos.Query.Core.Pipeline.CrossPartition.HybridSearch
                     maxConcurrency,
                     state,
                     globalStatisticsPipeline,
-                    queryPipelineStages));
+                    queryPipelineStages,
+                    fullTextScoreStatsCacheContext?.Cache,
+                    fullTextScoreStatsCacheKey));
         }
 
         public ValueTask DisposeAsync()
@@ -216,6 +243,44 @@ namespace Microsoft.Azure.Cosmos.Query.Core.Pipeline.CrossPartition.HybridSearch
 
         private async ValueTask<bool> MoveNextAsync_GatherGlobalStatisticsAsync(ITrace trace, CancellationToken cancellationToken)
         {
+            if ((this.fullTextScoreStatsCache != null) &&
+                !string.IsNullOrEmpty(this.fullTextScoreStatsCacheKey) &&
+                this.fullTextScoreStatsCache.TryGet(this.fullTextScoreStatsCacheKey, out GlobalFullTextSearchStatistics cachedStatistics))
+            {
+                trace?.AddOrUpdateDatum(FullTextScoreStatsCacheRootStatusDatum, FullTextScoreStatsCacheHit);
+                using (ITrace cacheTrace = trace?.StartChild(FullTextScoreStatsCacheTraceName, TraceComponent.Query, Microsoft.Azure.Cosmos.Tracing.TraceLevel.Info))
+                {
+                    cacheTrace?.AddDatum(FullTextScoreStatsCacheStatusDatum, FullTextScoreStatsCacheHit);
+                }
+
+                TryCatch<List<IQueryPipelineStage>> tryCreateCachedQueryPipelineStages = CreateQueryPipelineStages(
+                    this.hybridSearchQueryInfo.ComponentQueryInfos,
+                    cachedStatistics,
+                    this.pipelineFactory);
+                if (tryCreateCachedQueryPipelineStages.Failed)
+                {
+                    this.Current = TryCatch<QueryPage>.FromException(tryCreateCachedQueryPipelineStages.Exception);
+                    this.state = State.Done;
+                    return true;
+                }
+
+                this.queryPipelineStages = tryCreateCachedQueryPipelineStages.Result;
+                this.state = State.Initialized;
+                this.Current = TryCatch<QueryPage>.FromResult(CreateCachedStatisticsQueryPage());
+                return true;
+            }
+
+            if (!string.IsNullOrEmpty(this.fullTextScoreStatsCacheKey))
+            {
+                trace?.AddOrUpdateDatum(FullTextScoreStatsCacheRootStatusDatum, FullTextScoreStatsCacheMiss);
+                trace?.AddOrUpdateDatum(FullTextScoreStatsCacheRootReasonDatum, "NoValidEntry");
+                using (ITrace cacheTrace = trace?.StartChild(FullTextScoreStatsCacheTraceName, TraceComponent.Query, Microsoft.Azure.Cosmos.Tracing.TraceLevel.Info))
+                {
+                    cacheTrace?.AddDatum(FullTextScoreStatsCacheStatusDatum, FullTextScoreStatsCacheMiss);
+                    cacheTrace?.AddDatum(FullTextScoreStatsCacheReasonDatum, "NoValidEntry");
+                }
+            }
+
             TryCatch<(GlobalFullTextSearchStatistics, QueryPage)> tryGatherStatistics = await GatherStatisticsAsync(
                 this.globalStatisticsPipeline,
                 trace,
@@ -241,9 +306,28 @@ namespace Microsoft.Azure.Cosmos.Query.Core.Pipeline.CrossPartition.HybridSearch
             }
 
             this.queryPipelineStages = tryCreateQueryPipelineStages.Result;
+            if ((this.fullTextScoreStatsCache != null) && !string.IsNullOrEmpty(this.fullTextScoreStatsCacheKey))
+            {
+                this.fullTextScoreStatsCache.Set(this.fullTextScoreStatsCacheKey, statistics);
+            }
+
             this.state = State.Initialized;
             this.Current = TryCatch<QueryPage>.FromResult(queryPage);
             return true;
+        }
+
+        private static QueryPage CreateCachedStatisticsQueryPage()
+        {
+            return new QueryPage(
+                EmptyPage,
+                requestCharge: 0,
+                activityId: null,
+                cosmosQueryExecutionInfo: null,
+                distributionPlanSpec: null,
+                disallowContinuationTokenMessage: DisallowContinuationTokenMessages.HybridSearch,
+                additionalHeaders: null,
+                state: Continuation,
+                streaming: false);
         }
 
         private async ValueTask<bool> MoveNextAsync_RunComponentQueriesAsync(ITrace trace, CancellationToken cancellationToken)
