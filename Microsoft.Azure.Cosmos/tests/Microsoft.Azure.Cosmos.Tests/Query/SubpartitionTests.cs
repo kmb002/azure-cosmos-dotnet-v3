@@ -139,7 +139,8 @@
                 isHybridSearchQueryPlanOptimizationDisabled: queryRequestOptions.IsHybridSearchQueryPlanOptimizationDisabled,
                 enableDistributedQueryGatewayMode: queryRequestOptions.EnableDistributedQueryGatewayMode,
                 fullTextScoreScope: queryRequestOptions.FullTextScoreScope,
-                testInjections: queryRequestOptions.TestSettings);
+                testInjections: queryRequestOptions.TestSettings,
+                fullTextScoreStatsCacheContext: null);
 
             List<PartitionKeyRange> targetPkRanges = new();
             foreach (FeedRangeEpk feedRangeEpk in containerRanges)

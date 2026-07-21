@@ -7,7 +7,9 @@ namespace Microsoft.Azure.Cosmos.Tests.Query.Pipeline
     using System;
     using System.Collections.Generic;
     using System.Diagnostics;
+    using System.IO;
     using System.Linq;
+    using System.Text;
     using System.Threading;
     using System.Threading.Tasks;
     using Microsoft.Azure.Cosmos;
@@ -18,6 +20,7 @@ namespace Microsoft.Azure.Cosmos.Tests.Query.Pipeline
     using Microsoft.Azure.Cosmos.Query.Core;
     using Microsoft.Azure.Cosmos.Query.Core.Monads;
     using Microsoft.Azure.Cosmos.Query.Core.Pipeline;
+    using Microsoft.Azure.Cosmos.Query.Core.Pipeline.CrossPartition.HybridSearch;
     using Microsoft.Azure.Cosmos.Query.Core.Pipeline.CrossPartition.OrderBy;
     using Microsoft.Azure.Cosmos.Query.Core.Pipeline.Distinct;
     using Microsoft.Azure.Cosmos.Query.Core.Pipeline.Pagination;
@@ -853,6 +856,514 @@ namespace Microsoft.Azure.Cosmos.Tests.Query.Pipeline
             return RunParityTests(documentContainer, nonStreamingDocumentContainer, testCases, TestOptions.Default);
         }
 
+        [TestMethod]
+        public async Task FullTextScoreStatsCacheHitDrainsComponentQueriesImmediatelyTest()
+        {
+            IReadOnlyList<FeedRangeEpk> allRanges = new List<FeedRangeEpk>()
+            {
+                new FeedRangeEpk(new Documents.Routing.Range<string>("A", "B", true, false)),
+                new FeedRangeEpk(new Documents.Routing.Range<string>("B", "C", true, false)),
+            };
+
+            MockDocumentContainer documentContainer = MockDocumentContainer.CreateHybridSearchContainer(
+                allRanges,
+                Enumerable.Repeat(PartitionedFeedMode.NonStreaming, allRanges.Count).ToArray(),
+                leafPageCount: 2,
+                backendPageSize: 2,
+                returnEmptyGlobalStatistics: false,
+                skipOrderByRewrite: false);
+
+            FullTextScoreStatsCache cache = new FullTextScoreStatsCache(TimeSpan.FromMinutes(5), new CosmosSerializerCore());
+            FullTextScoreStatsCacheContext cacheContext = new FullTextScoreStatsCacheContext(cache, "db", "container");
+            HybridSearchQueryInfo hybridSearchQueryInfo = Create2ItemHybridSearchQueryInfo(
+                requiresGlobalStatistics: true,
+                skip: null,
+                take: null,
+                weights: null);
+
+            TryCatch<IQueryPipelineStage> warmPipeline = PipelineFactory.MonadicCreate(
+                documentContainer,
+                Create2ItemSqlQuerySpec(),
+                allRanges,
+                partitionKey: null,
+                queryInfo: null,
+                hybridSearchQueryInfo: hybridSearchQueryInfo,
+                maxItemCount: 10,
+                new ContainerQueryProperties(),
+                allRanges,
+                isContinuationExpected: true,
+                maxConcurrency: MaxConcurrency,
+                fullTextScoreScope: FullTextScoreScope.Global,
+                requestContinuationToken: null,
+                fullTextScoreStatsCacheContext: cacheContext);
+
+            Assert.IsTrue(warmPipeline.Succeeded);
+            await RunPipelineStage(warmPipeline.Result, 10);
+
+            TryCatch<IQueryPipelineStage> hitPipeline = PipelineFactory.MonadicCreate(
+                documentContainer,
+                Create2ItemSqlQuerySpec(),
+                allRanges,
+                partitionKey: null,
+                queryInfo: null,
+                hybridSearchQueryInfo: hybridSearchQueryInfo,
+                maxItemCount: 10,
+                new ContainerQueryProperties(),
+                allRanges,
+                isContinuationExpected: true,
+                maxConcurrency: MaxConcurrency,
+                fullTextScoreScope: FullTextScoreScope.Global,
+                requestContinuationToken: null,
+                fullTextScoreStatsCacheContext: cacheContext);
+
+            Assert.IsTrue(hitPipeline.Succeeded);
+
+            // cache hit should be fast and the first page should reflect the work of running the queries
+            const double expectedRequestCharge = 2 * 2 * 2 * QueryCharge;
+            Assert.IsTrue(await hitPipeline.Result.MoveNextAsync(NoOpTrace.Singleton, default));
+            Assert.IsTrue(hitPipeline.Result.Current.Succeeded);
+            Assert.AreEqual(expectedRequestCharge, hitPipeline.Result.Current.Result.RequestCharge);
+            Assert.AreEqual("HybridSearchInProgress", ((CosmosString)hitPipeline.Result.Current.Result.State.Value).Value);
+        }
+
+        [TestMethod]
+        public async Task FullTextScoreStatsCacheAddsHitAndMissDiagnosticsTest()
+        {
+            IReadOnlyList<FeedRangeEpk> allRanges = new List<FeedRangeEpk>()
+            {
+                new FeedRangeEpk(new Documents.Routing.Range<string>("A", "B", true, false)),
+                new FeedRangeEpk(new Documents.Routing.Range<string>("B", "C", true, false)),
+            };
+
+            MockDocumentContainer documentContainer = MockDocumentContainer.CreateHybridSearchContainer(
+                allRanges,
+                Enumerable.Repeat(PartitionedFeedMode.NonStreaming, allRanges.Count).ToArray(),
+                leafPageCount: 2,
+                backendPageSize: 2,
+                returnEmptyGlobalStatistics: false,
+                skipOrderByRewrite: false);
+
+            FullTextScoreStatsCache cache = new FullTextScoreStatsCache(TimeSpan.FromMinutes(5), new CosmosSerializerCore());
+            FullTextScoreStatsCacheContext cacheContext = new FullTextScoreStatsCacheContext(cache, "db", "container");
+            HybridSearchQueryInfo hybridSearchQueryInfo = Create2ItemHybridSearchQueryInfo(
+                requiresGlobalStatistics: true,
+                skip: null,
+                take: null,
+                weights: null);
+
+            using ITrace missTrace = Microsoft.Azure.Cosmos.Tracing.Trace.GetRootTrace("HybridSearchGlobalStatisticsCacheMiss");
+            TryCatch<IQueryPipelineStage> missPipeline = PipelineFactory.MonadicCreate(
+                documentContainer,
+                Create2ItemSqlQuerySpec(),
+                allRanges,
+                partitionKey: null,
+                queryInfo: null,
+                hybridSearchQueryInfo: hybridSearchQueryInfo,
+                maxItemCount: 10,
+                new ContainerQueryProperties(),
+                allRanges,
+                isContinuationExpected: true,
+                maxConcurrency: MaxConcurrency,
+                fullTextScoreScope: FullTextScoreScope.Global,
+                requestContinuationToken: null,
+                fullTextScoreStatsCacheContext: cacheContext);
+
+            Assert.IsTrue(missPipeline.Succeeded);
+            Assert.IsTrue(await missPipeline.Result.MoveNextAsync(missTrace, default));
+            Assert.IsTrue(missTrace.TryGetDatum("BM25FullTextScoreStatsCacheStatus", out object missStatus));
+            Assert.AreEqual("Miss", missStatus);
+
+            using ITrace hitTrace = Microsoft.Azure.Cosmos.Tracing.Trace.GetRootTrace("HybridSearchGlobalStatisticsCacheHit");
+            TryCatch<IQueryPipelineStage> hitPipeline = PipelineFactory.MonadicCreate(
+                documentContainer,
+                Create2ItemSqlQuerySpec(),
+                allRanges,
+                partitionKey: null,
+                queryInfo: null,
+                hybridSearchQueryInfo: hybridSearchQueryInfo,
+                maxItemCount: 10,
+                new ContainerQueryProperties(),
+                allRanges,
+                isContinuationExpected: true,
+                maxConcurrency: MaxConcurrency,
+                fullTextScoreScope: FullTextScoreScope.Global,
+                requestContinuationToken: null,
+                fullTextScoreStatsCacheContext: cacheContext);
+
+            Assert.IsTrue(hitPipeline.Succeeded);
+            Assert.IsTrue(await hitPipeline.Result.MoveNextAsync(hitTrace, default));
+            Assert.IsTrue(hitTrace.TryGetDatum("BM25FullTextScoreStatsCacheStatus", out object hitStatus));
+            Assert.AreEqual("Hit", hitStatus);
+        }
+
+        [TestMethod]
+        public async Task FullTextScoreStatsCacheLocalScopeBypassesCacheTest()
+        {
+            IReadOnlyList<FeedRangeEpk> allRanges = new List<FeedRangeEpk>()
+            {
+                new FeedRangeEpk(new Documents.Routing.Range<string>("A", "B", true, false)),
+                new FeedRangeEpk(new Documents.Routing.Range<string>("B", "C", true, false)),
+            };
+
+            MockDocumentContainer documentContainer = MockDocumentContainer.CreateHybridSearchContainer(
+                allRanges,
+                Enumerable.Repeat(PartitionedFeedMode.NonStreaming, allRanges.Count).ToArray(),
+                leafPageCount: 2,
+                backendPageSize: 2,
+                returnEmptyGlobalStatistics: false,
+                skipOrderByRewrite: false);
+
+            FullTextScoreStatsCache cache = new FullTextScoreStatsCache(TimeSpan.FromMinutes(5), new CosmosSerializerCore());
+            FullTextScoreStatsCacheContext cacheContext = new FullTextScoreStatsCacheContext(cache, "db", "container");
+            HybridSearchQueryInfo hybridSearchQueryInfo = Create2ItemHybridSearchQueryInfo(
+                requiresGlobalStatistics: true,
+                skip: null,
+                take: null,
+                weights: null);
+
+            for (int i = 0; i < 2; i++)
+            {
+                TryCatch<IQueryPipelineStage> pipeline = PipelineFactory.MonadicCreate(
+                    documentContainer,
+                    Create2ItemSqlQuerySpec(),
+                    allRanges,
+                    partitionKey: null,
+                    queryInfo: null,
+                    hybridSearchQueryInfo: hybridSearchQueryInfo,
+                    maxItemCount: 10,
+                    new ContainerQueryProperties(),
+                    allRanges,
+                    isContinuationExpected: true,
+                    maxConcurrency: MaxConcurrency,
+                    fullTextScoreScope: FullTextScoreScope.Local,
+                    requestContinuationToken: null,
+                    fullTextScoreStatsCacheContext: cacheContext);
+
+                Assert.IsTrue(pipeline.Succeeded);
+                await RunPipelineStage(pipeline.Result, 10);
+            }
+
+            Assert.AreEqual(allRanges.Count * 2, documentContainer.StatisticsQueryCount);
+        }
+
+        [TestMethod]
+        public void FullTextScoreStatsCacheKeySeparatesContainerIdentityTest()
+        {
+            FullTextScoreStatsCache cache = new FullTextScoreStatsCache(TimeSpan.FromMinutes(5), new CosmosSerializerCore());
+            SqlParameterCollection parameters = new SqlParameterCollection(new[]
+            {
+                new SqlParameter("@distance", 2),
+                new SqlParameter("@term", "swim"),
+            });
+
+            string key1 = cache.CreateCacheKey(
+                databaseId: "db1",
+                containerId: "container",
+                globalStatisticsQueryText: "SELECT VALUE @term FROM c WHERE c.distance = @distance",
+                parameters: parameters);
+
+            string key2 = cache.CreateCacheKey(
+                databaseId: "db2",
+                containerId: "container",
+                globalStatisticsQueryText: "SELECT VALUE @term FROM c WHERE c.distance = @distance",
+                parameters: parameters);
+
+            string key3 = cache.CreateCacheKey(
+                databaseId: "db1",
+                containerId: "container2",
+                globalStatisticsQueryText: "SELECT VALUE @term FROM c WHERE c.distance = @distance",
+                parameters: parameters);
+
+            Assert.AreNotEqual(key1, key2);
+            Assert.AreNotEqual(key1, key3);
+        }
+
+        [TestMethod]
+        public void FullTextScoreStatsCacheKeyUsesEquivalentInputsTest()
+        {
+            FullTextScoreStatsCache cache = new FullTextScoreStatsCache(TimeSpan.FromMinutes(5), new CosmosSerializerCore());
+            SqlParameterCollection parameters1 = new SqlParameterCollection(new[]
+            {
+                new SqlParameter("@distance", 2),
+                new SqlParameter("@term", "swim"),
+            });
+
+            SqlParameterCollection parameters2 = new SqlParameterCollection(new[]
+            {
+                new SqlParameter("@distance", 2),
+                new SqlParameter("@term", "swim"),
+            });
+
+            string key1 = cache.CreateCacheKey(
+                databaseId: "db",
+                containerId: "container",
+                globalStatisticsQueryText: "SELECT VALUE @term FROM c WHERE c.distance = @distance",
+                parameters: parameters1);
+
+            string key2 = cache.CreateCacheKey(
+                databaseId: "db",
+                containerId: "container",
+                globalStatisticsQueryText: "SELECT VALUE @term FROM c WHERE c.distance = @distance",
+                parameters: parameters2);
+
+            Assert.AreEqual(key1, key2);
+        }
+
+        [TestMethod]
+        public void FullTextScoreStatsCacheKeyTreatsRawStreamParametersAsTheirWireValuesTest()
+        {
+            FullTextScoreStatsCache cache = new FullTextScoreStatsCache(TimeSpan.FromMinutes(5), new CosmosSerializerCore());
+            string globalStatisticsQueryText = "SELECT VALUE @termCount FROM c";
+
+            SqlParameterCollection parametersFromObject = new SqlParameterCollection(new[]
+            {
+                new SqlParameter("@termCount", 123),
+            });
+
+            QueryDefinition queryDefinition = new QueryDefinition(globalStatisticsQueryText)
+                .WithParameterStream("@termCount", new MemoryStream(Encoding.UTF8.GetBytes("123")));
+            SqlParameterCollection parametersFromRawStream = queryDefinition.ToSqlQuerySpec().Parameters;
+
+            // this should not change as we want keys to be consistent
+            string expected = "4c66d6cc7571d6dcbb341c29507e065e19ff1faaf17c2e736e7c9da835f1b181";
+
+            string objectKey = cache.CreateCacheKey(
+                databaseId: "db",
+                containerId: "container",
+                globalStatisticsQueryText: globalStatisticsQueryText,
+                parameters: parametersFromObject);
+            Assert.AreEqual(expected, objectKey);
+
+            string rawStreamKey = cache.CreateCacheKey(
+                databaseId: "db",
+                containerId: "container",
+                globalStatisticsQueryText: globalStatisticsQueryText,
+                parameters: parametersFromRawStream);
+
+            Assert.AreEqual(objectKey, rawStreamKey);
+        }
+
+        [TestMethod]
+        public void FullTextScoreStatsCacheEvictsOldestEntryWhenLimitExceededTest()
+        {
+            FullTextScoreStatsCache cache = new FullTextScoreStatsCache(TimeSpan.FromMinutes(5), new CosmosSerializerCore());
+
+            for (int i = 0; i < 100; i++)
+            {
+                cache.Set($"key-{i}", CreateTestGlobalFullTextSearchStatistics(i));
+                Thread.Sleep(1);
+            }
+
+            cache.Set("key-100", CreateTestGlobalFullTextSearchStatistics(100));
+
+            Assert.IsFalse(cache.TryGet("key-0", out _));
+
+            for (int i = 1; i <= 100; i++)
+            {
+                Assert.IsTrue(cache.TryGet($"key-{i}", out _));
+            }
+        }
+
+        [TestMethod]
+        public void FullTextScoreStatsCachePrunesExpiredEntriesBeforeEvictingNonExpiredEntriesTest()
+        {
+            FullTextScoreStatsCache cache = new FullTextScoreStatsCache(TimeSpan.FromSeconds(5), new CosmosSerializerCore());
+
+            cache.Set("expired", CreateTestGlobalFullTextSearchStatistics(0));
+            Thread.Sleep(TimeSpan.FromSeconds(6));
+
+            for (int i = 1; i < 100; i++)
+            {
+                cache.Set($"key-{i}", CreateTestGlobalFullTextSearchStatistics(i));
+                Thread.Sleep(1);
+            }
+
+            cache.Set("key-100", CreateTestGlobalFullTextSearchStatistics(100));
+
+            Assert.IsFalse(cache.TryGet("expired", out _));
+            Assert.IsTrue(cache.TryGet("key-1", out _));
+            Assert.IsTrue(cache.TryGet("key-100", out _));
+        }
+
+        [TestMethod]
+        public void FullTextScoreStatsCacheUpdatingExistingKeyDoesNotEvictAtCapacityTest()
+        {
+            FullTextScoreStatsCache cache = new FullTextScoreStatsCache(TimeSpan.FromMinutes(5), new CosmosSerializerCore());
+
+            for (int i = 0; i < 100; i++)
+            {
+                cache.Set($"key-{i}", CreateTestGlobalFullTextSearchStatistics(i));
+                Thread.Sleep(1);
+            }
+
+            cache.Set("key-0", CreateTestGlobalFullTextSearchStatistics(1000));
+
+            for (int i = 0; i < 100; i++)
+            {
+                Assert.IsTrue(cache.TryGet($"key-{i}", out GlobalFullTextSearchStatistics statistics));
+                if (i == 0)
+                {
+                    Assert.AreEqual(1000, statistics.DocumentCount);
+                }
+            }
+        }
+
+        [TestMethod]
+        public async Task FullTextScoreStatsCacheExpiredEntryDoesNotGetReusedTest()
+        {
+            IReadOnlyList<FeedRangeEpk> allRanges = new List<FeedRangeEpk>()
+            {
+                new FeedRangeEpk(new Documents.Routing.Range<string>("A", "B", true, false)),
+                new FeedRangeEpk(new Documents.Routing.Range<string>("B", "C", true, false)),
+            };
+
+            MockDocumentContainer documentContainer = MockDocumentContainer.CreateHybridSearchContainer(
+                allRanges,
+                Enumerable.Repeat(PartitionedFeedMode.NonStreaming, allRanges.Count).ToArray(),
+                leafPageCount: 2,
+                backendPageSize: 2,
+                returnEmptyGlobalStatistics: false,
+                skipOrderByRewrite: false);
+
+            FullTextScoreStatsCache cache = new FullTextScoreStatsCache(TimeSpan.Zero, new CosmosSerializerCore());
+            FullTextScoreStatsCacheContext cacheContext = new FullTextScoreStatsCacheContext(cache, "db", "container");
+            HybridSearchQueryInfo hybridSearchQueryInfo = Create2ItemHybridSearchQueryInfo(
+                requiresGlobalStatistics: true,
+                skip: null,
+                take: null,
+                weights: null);
+
+            for (int i = 0; i < 2; i++)
+            {
+                TryCatch<IQueryPipelineStage> pipeline = PipelineFactory.MonadicCreate(
+                    documentContainer,
+                    Create2ItemSqlQuerySpec(),
+                    allRanges,
+                    partitionKey: null,
+                    queryInfo: null,
+                    hybridSearchQueryInfo: hybridSearchQueryInfo,
+                    maxItemCount: 10,
+                    new ContainerQueryProperties(),
+                    allRanges,
+                    isContinuationExpected: true,
+                    maxConcurrency: MaxConcurrency,
+                    fullTextScoreScope: FullTextScoreScope.Global,
+                    requestContinuationToken: null,
+                    fullTextScoreStatsCacheContext: cacheContext);
+
+                Assert.IsTrue(pipeline.Succeeded);
+                await RunPipelineStage(pipeline.Result, 10);
+            }
+
+            Assert.AreEqual(allRanges.Count * 2, documentContainer.StatisticsQueryCount);
+        }
+
+        [TestMethod]
+        public void FullTextScoreStatsCacheKeyDiffersByConfiguredSerializerTest()
+        {
+            // Confirms that the cache key is actually computed using the caller-supplied CosmosSerializerCore
+            // (which honors a customer's custom CosmosSerializer) rather than a hardcoded JSON library. Two caches
+            // that differ only in serializer configuration must produce different keys for the same logical inputs.
+            FullTextScoreStatsCache defaultCache = new FullTextScoreStatsCache(TimeSpan.FromMinutes(5), new CosmosSerializerCore());
+            FullTextScoreStatsCache customCache = new FullTextScoreStatsCache(
+                TimeSpan.FromMinutes(5),
+                new CosmosSerializerCore(customSerializer: new ReversingCustomSerializer()));
+
+            SqlParameterCollection parameters = new SqlParameterCollection(new[]
+            {
+                new SqlParameter("@distance", 2),
+                new SqlParameter("@term", "swim"),
+            });
+
+            string defaultKey = defaultCache.CreateCacheKey(
+                databaseId: "db",
+                containerId: "container",
+                globalStatisticsQueryText: "SELECT VALUE @term FROM c WHERE c.distance = @distance",
+                parameters: parameters);
+
+            string customKey = customCache.CreateCacheKey(
+                databaseId: "db",
+                containerId: "container",
+                globalStatisticsQueryText: "SELECT VALUE @term FROM c WHERE c.distance = @distance",
+                parameters: parameters);
+
+            Assert.AreNotEqual(defaultKey, customKey);
+        }
+
+        [TestMethod]
+        public async Task FullTextScoreStatsCacheHitAndMissWorksWithCustomSerializerTest()
+        {
+            // End-to-end validation that the BM25 global statistics cache (not just key generation) functions
+            // correctly when the client is configured with a nontrivial, non-default CosmosSerializer.
+            IReadOnlyList<FeedRangeEpk> allRanges = new List<FeedRangeEpk>()
+            {
+                new FeedRangeEpk(new Documents.Routing.Range<string>("A", "B", true, false)),
+                new FeedRangeEpk(new Documents.Routing.Range<string>("B", "C", true, false)),
+            };
+
+            MockDocumentContainer documentContainer = MockDocumentContainer.CreateHybridSearchContainer(
+                allRanges,
+                Enumerable.Repeat(PartitionedFeedMode.NonStreaming, allRanges.Count).ToArray(),
+                leafPageCount: 2,
+                backendPageSize: 2,
+                returnEmptyGlobalStatistics: false,
+                skipOrderByRewrite: false);
+
+            FullTextScoreStatsCache cache = new FullTextScoreStatsCache(
+                TimeSpan.FromMinutes(5),
+                new CosmosSerializerCore(customSerializer: new ReversingCustomSerializer()));
+            FullTextScoreStatsCacheContext cacheContext = new FullTextScoreStatsCacheContext(cache, "db", "container");
+            HybridSearchQueryInfo hybridSearchQueryInfo = Create2ItemHybridSearchQueryInfo(
+                requiresGlobalStatistics: true,
+                skip: null,
+                take: null,
+                weights: null);
+
+            using ITrace missTrace = Microsoft.Azure.Cosmos.Tracing.Trace.GetRootTrace("HybridSearchGlobalStatisticsCacheMissCustomSerializer");
+            TryCatch<IQueryPipelineStage> missPipeline = PipelineFactory.MonadicCreate(
+                documentContainer,
+                Create2ItemSqlQuerySpec(),
+                allRanges,
+                partitionKey: null,
+                queryInfo: null,
+                hybridSearchQueryInfo: hybridSearchQueryInfo,
+                maxItemCount: 10,
+                new ContainerQueryProperties(),
+                allRanges,
+                isContinuationExpected: true,
+                maxConcurrency: MaxConcurrency,
+                fullTextScoreScope: FullTextScoreScope.Global,
+                requestContinuationToken: null,
+                fullTextScoreStatsCacheContext: cacheContext);
+
+            Assert.IsTrue(missPipeline.Succeeded);
+            Assert.IsTrue(await missPipeline.Result.MoveNextAsync(missTrace, default));
+            Assert.IsTrue(missTrace.TryGetDatum("BM25FullTextScoreStatsCacheStatus", out object missStatus));
+            Assert.AreEqual("Miss", missStatus);
+
+            using ITrace hitTrace = Microsoft.Azure.Cosmos.Tracing.Trace.GetRootTrace("HybridSearchGlobalStatisticsCacheHitCustomSerializer");
+            TryCatch<IQueryPipelineStage> hitPipeline = PipelineFactory.MonadicCreate(
+                documentContainer,
+                Create2ItemSqlQuerySpec(),
+                allRanges,
+                partitionKey: null,
+                queryInfo: null,
+                hybridSearchQueryInfo: hybridSearchQueryInfo,
+                maxItemCount: 10,
+                new ContainerQueryProperties(),
+                allRanges,
+                isContinuationExpected: true,
+                maxConcurrency: MaxConcurrency,
+                fullTextScoreScope: FullTextScoreScope.Global,
+                requestContinuationToken: null,
+                fullTextScoreStatsCacheContext: cacheContext);
+
+            Assert.IsTrue(hitPipeline.Succeeded);
+            Assert.IsTrue(await hitPipeline.Result.MoveNextAsync(hitTrace, default));
+            Assert.IsTrue(hitTrace.TryGetDatum("BM25FullTextScoreStatsCacheStatus", out object hitStatus));
+            Assert.AreEqual("Hit", hitStatus);
+        }
+
         private static async Task RunParityTests(
             IDocumentContainer documentContainer,
             IDocumentContainer nonStreamingDocumentContainer,
@@ -928,7 +1439,8 @@ namespace Microsoft.Azure.Cosmos.Tests.Query.Pipeline
                 isContinuationExpected: true,
                 maxConcurrency: MaxConcurrency,
                 fullTextScoreScope: fullTextScoreScope,
-                requestContinuationToken: null);
+                requestContinuationToken: null,
+                fullTextScoreStatsCacheContext: null);
 
             Assert.IsTrue(tryCreatePipeline.Succeeded);
             return RunPipelineStage(tryCreatePipeline.Result, pageSize);
@@ -1070,6 +1582,16 @@ namespace Microsoft.Azure.Cosmos.Tests.Query.Pipeline
             return new TestCase(queryText, orderByColumns, pageSizes, validate);
         }
 
+        private static GlobalFullTextSearchStatistics CreateTestGlobalFullTextSearchStatistics(long seed)
+        {
+            return new GlobalFullTextSearchStatistics(
+                documentCount: seed,
+                fullTextStatistics: new List<FullTextStatistics>
+                {
+                    new FullTextStatistics(seed + 1, new long[] { seed + 2 }),
+                });
+        }
+
         private class TestCase
         {
             public string QueryText { get; }
@@ -1090,6 +1612,36 @@ namespace Microsoft.Azure.Cosmos.Tests.Query.Pipeline
                 this.OrderByColumns = orderByColumns;
                 this.PageSizes = pageSizes;
                 this.Validate = validate;
+            }
+        }
+
+        /// <summary>
+        /// A nontrivial, non-default <see cref="CosmosSerializer"/> used to prove that the BM25 global statistics
+        /// cache genuinely routes serialization through the client's configured serializer rather than a hardcoded
+        /// JSON library. It produces JSON that is reversed character-by-character, so its output is guaranteed to
+        /// differ from the default serializer's output for any non-palindromic payload.
+        /// </summary>
+        private class ReversingCustomSerializer : CosmosSerializer
+        {
+            public override T FromStream<T>(Stream stream)
+            {
+                using (StreamReader reader = new StreamReader(stream, Encoding.UTF8))
+                {
+                    string reversed = reader.ReadToEnd();
+                    char[] chars = reversed.ToCharArray();
+                    Array.Reverse(chars);
+                    string json = new string(chars);
+                    return Newtonsoft.Json.JsonConvert.DeserializeObject<T>(json);
+                }
+            }
+
+            public override Stream ToStream<T>(T input)
+            {
+                string json = Newtonsoft.Json.JsonConvert.SerializeObject(input);
+                char[] chars = json.ToCharArray();
+                Array.Reverse(chars);
+                byte[] bytes = Encoding.UTF8.GetBytes(new string(chars));
+                return new MemoryStream(bytes);
             }
         }
 
@@ -1626,6 +2178,8 @@ namespace Microsoft.Azure.Cosmos.Tests.Query.Pipeline
             private int queryCount;
 
             public IReadOnlyList<FeedRange> StatisticsQueryRanges => this.statisticsQueryRanges;
+
+            public int StatisticsQueryCount => Interlocked.CompareExchange(ref this.statisticsQueryCount, 0, 0);
 
             public double TotalRequestCharge
             {
