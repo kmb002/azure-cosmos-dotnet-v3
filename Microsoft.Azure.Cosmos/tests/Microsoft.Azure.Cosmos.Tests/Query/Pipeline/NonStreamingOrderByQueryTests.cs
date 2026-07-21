@@ -1144,6 +1144,71 @@ namespace Microsoft.Azure.Cosmos.Tests.Query.Pipeline
         }
 
         [TestMethod]
+        public void FullTextScoreStatsCacheEvictsOldestEntryWhenLimitExceededTest()
+        {
+            FullTextScoreStatsCache cache = new FullTextScoreStatsCache(TimeSpan.FromMinutes(5), new CosmosSerializerCore());
+
+            for (int i = 0; i < 100; i++)
+            {
+                cache.Set($"key-{i}", CreateTestGlobalFullTextSearchStatistics(i));
+                Thread.Sleep(1);
+            }
+
+            cache.Set("key-100", CreateTestGlobalFullTextSearchStatistics(100));
+
+            Assert.IsFalse(cache.TryGet("key-0", out _));
+
+            for (int i = 1; i <= 100; i++)
+            {
+                Assert.IsTrue(cache.TryGet($"key-{i}", out _));
+            }
+        }
+
+        [TestMethod]
+        public void FullTextScoreStatsCachePrunesExpiredEntriesBeforeEvictingNonExpiredEntriesTest()
+        {
+            FullTextScoreStatsCache cache = new FullTextScoreStatsCache(TimeSpan.FromSeconds(5), new CosmosSerializerCore());
+
+            cache.Set("expired", CreateTestGlobalFullTextSearchStatistics(0));
+            Thread.Sleep(TimeSpan.FromSeconds(6));
+
+            for (int i = 1; i < 100; i++)
+            {
+                cache.Set($"key-{i}", CreateTestGlobalFullTextSearchStatistics(i));
+                Thread.Sleep(1);
+            }
+
+            cache.Set("key-100", CreateTestGlobalFullTextSearchStatistics(100));
+
+            Assert.IsFalse(cache.TryGet("expired", out _));
+            Assert.IsTrue(cache.TryGet("key-1", out _));
+            Assert.IsTrue(cache.TryGet("key-100", out _));
+        }
+
+        [TestMethod]
+        public void FullTextScoreStatsCacheUpdatingExistingKeyDoesNotEvictAtCapacityTest()
+        {
+            FullTextScoreStatsCache cache = new FullTextScoreStatsCache(TimeSpan.FromMinutes(5), new CosmosSerializerCore());
+
+            for (int i = 0; i < 100; i++)
+            {
+                cache.Set($"key-{i}", CreateTestGlobalFullTextSearchStatistics(i));
+                Thread.Sleep(1);
+            }
+
+            cache.Set("key-0", CreateTestGlobalFullTextSearchStatistics(1000));
+
+            for (int i = 0; i < 100; i++)
+            {
+                Assert.IsTrue(cache.TryGet($"key-{i}", out GlobalFullTextSearchStatistics statistics));
+                if (i == 0)
+                {
+                    Assert.AreEqual(1000, statistics.DocumentCount);
+                }
+            }
+        }
+
+        [TestMethod]
         public async Task FullTextScoreStatsCacheExpiredEntryDoesNotGetReusedTest()
         {
             IReadOnlyList<FeedRangeEpk> allRanges = new List<FeedRangeEpk>()
@@ -1515,6 +1580,16 @@ namespace Microsoft.Azure.Cosmos.Tests.Query.Pipeline
             Func<IReadOnlyList<CosmosElement>, bool> validate)
         {
             return new TestCase(queryText, orderByColumns, pageSizes, validate);
+        }
+
+        private static GlobalFullTextSearchStatistics CreateTestGlobalFullTextSearchStatistics(long seed)
+        {
+            return new GlobalFullTextSearchStatistics(
+                documentCount: seed,
+                fullTextStatistics: new List<FullTextStatistics>
+                {
+                    new FullTextStatistics(seed + 1, new long[] { seed + 2 }),
+                });
         }
 
         private class TestCase

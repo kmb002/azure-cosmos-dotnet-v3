@@ -6,6 +6,7 @@ namespace Microsoft.Azure.Cosmos.Query.Core.Pipeline.CrossPartition.HybridSearch
 {
     using System;
     using System.Collections.Concurrent;
+    using System.Collections.Generic;
     using System.IO;
     using System.Security.Cryptography;
     using System.Text;
@@ -16,14 +17,18 @@ namespace Microsoft.Azure.Cosmos.Query.Core.Pipeline.CrossPartition.HybridSearch
 
     internal sealed class FullTextScoreStatsCache
     {
+        private const int MaxEntryCount = 100;
+
         private readonly ConcurrentDictionary<string, CacheEntry> cache;
         private readonly Cosmos.CosmosSerializerCore serializerCore;
+        private readonly object syncLock;
 
         public FullTextScoreStatsCache(TimeSpan timeToLive, Cosmos.CosmosSerializerCore serializerCore)
         {
             this.TimeToLive = timeToLive;
             this.serializerCore = serializerCore ?? throw new ArgumentNullException(nameof(serializerCore));
             this.cache = new ConcurrentDictionary<string, CacheEntry>();
+            this.syncLock = new object();
         }
 
         public TimeSpan TimeToLive { get; }
@@ -116,7 +121,54 @@ namespace Microsoft.Azure.Cosmos.Query.Core.Pipeline.CrossPartition.HybridSearch
                 throw new ArgumentNullException(nameof(statistics));
             }
 
-            this.cache[cacheKey] = new CacheEntry(DateTime.UtcNow, statistics);
+            DateTime now = DateTime.UtcNow;
+            lock (this.syncLock)
+            {
+                this.RemoveExpiredEntries(now);
+
+                if (!this.cache.ContainsKey(cacheKey))
+                {
+                    this.EvictEntriesUntilBelowCapacity();
+                }
+
+                this.cache[cacheKey] = new CacheEntry(now, statistics);
+            }
+        }
+
+        private void RemoveExpiredEntries(DateTime now)
+        {
+            foreach (KeyValuePair<string, CacheEntry> entry in this.cache)
+            {
+                if ((now - entry.Value.CachedAtUtc) > this.TimeToLive)
+                {
+                    this.cache.TryRemove(entry.Key, out _);
+                }
+            }
+        }
+
+        private void EvictEntriesUntilBelowCapacity()
+        {
+            while (this.cache.Count >= MaxEntryCount)
+            {
+                string oldestKey = null;
+                DateTime oldestCachedAtUtc = DateTime.MaxValue;
+
+                foreach (KeyValuePair<string, CacheEntry> entry in this.cache)
+                {
+                    if (entry.Value.CachedAtUtc < oldestCachedAtUtc)
+                    {
+                        oldestCachedAtUtc = entry.Value.CachedAtUtc;
+                        oldestKey = entry.Key;
+                    }
+                }
+
+                if (oldestKey == null)
+                {
+                    return;
+                }
+
+                this.cache.TryRemove(oldestKey, out _);
+            }
         }
 
         private static string BytesToHexString(byte[] bytes)
